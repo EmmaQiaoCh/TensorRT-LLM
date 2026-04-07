@@ -1013,7 +1013,11 @@ def getCommonParameters()
 
 def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
     def parameters = getCommonParameters()
-    String globalVarsJson = writeJSON returnText: true, json: globalVars
+    // Build a local copy to avoid racey growth from shared parallel mutations.
+    // In particular, CACHED_CHANGED_FILE_LIST can become very large and may
+    // trigger "Argument list too long" when passed to downstream jobs.
+    def globalVarsToPass = globalVars.findAll { key, value -> key != CACHED_CHANGED_FILE_LIST }
+    String globalVarsJson = writeJSON returnText: true, json: globalVarsToPass
     parameters += [
         'enableFailFast': enableFailFast,
         'globalVars': globalVarsJson,
@@ -1374,6 +1378,18 @@ pipeline {
                 }
             }
         }
+        failure {
+            script {
+                try {
+                    def analysis = trtllm_utils.analyzePipelineFailureWithAgent(this, env.JOB_NAME, env.BUILD_NUMBER)
+                    if (analysis) {
+                        echo "=== CI Agent Failure Analysis ===\n${analysis}"
+                    }
+                } catch (Exception e) {
+                    // Analysis is best-effort; do not fail the pipeline
+                }
+            }
+        }
         always {
             script {
                 if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
@@ -1426,8 +1442,8 @@ pipeline {
                         }
                     } else {
                         // globalVars[CACHED_CHANGED_FILE_LIST] is only used in setupPipelineEnvironment
-                        // Reset it to null to workaround the "Argument list too long" error
-                        globalVars[CACHED_CHANGED_FILE_LIST] = null
+                        // Remove it to workaround the "Argument list too long" error
+                        globalVars.remove(CACHED_CHANGED_FILE_LIST)
                         launchStages(this, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
