@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/common/ncclUtils.h"
+#include "tensorrt_llm/common/nvmlWrapper.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
@@ -85,19 +86,8 @@ struct overloaded : Ts...
 template <class... Ts>
 overloaded(Ts...) -> overloaded<Ts...>;
 
-class NvmlManager
-{
-public:
-    NvmlManager()
-    {
-        NVML_CHECK_THROW(nvmlInit());
-    }
-
-    ~NvmlManager()
-    {
-        NVML_CHECK(nvmlShutdown());
-    }
-};
+using tensorrt_llm::common::NvmlManager;
+using tensorrt_llm::common::NVMLWrapper;
 
 std::set<int> getLocalGroup(std::set<int> const& group)
 {
@@ -533,7 +523,7 @@ private:
             {
                 // Large buffer: create window buffer and copy input (can swap inputTensor reference)
                 auto [symmetricInput, symmetricBuffer0]
-                    = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
+                    = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
                 if (!symmetricBuffer0.isValid())
                 {
                     TLLM_LOG_DEBUG(
@@ -559,7 +549,7 @@ private:
         }
 
         // Use window-backed output buffer
-        auto [normOut, windowBuffer1] = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
+        auto [normOut, windowBuffer1] = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
         torch::Tensor outputTensor = windowBuffer1.isValid() ? normOut : torch::empty_like(inputTensor);
         void* outputPtr = windowBuffer1.isValid() ? windowBuffer1.ptr : outputTensor.data_ptr();
         if (!windowBuffer1.isValid())
@@ -716,6 +706,13 @@ private:
         }
         // Handle allreduce fusion here
         // Prepare required output tensors for each fusion pattern
+        else if (mOp == AllReduceFusionOp::RMS_NORM)
+        {
+            norm_out = torch::empty_like(input);
+
+            allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
+            allreduce_fusion_params.pattern = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARRMSNorm;
+        }
         else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
         {
             norm_out = torch::empty_like(input);
@@ -800,7 +797,10 @@ private:
 
         if (mOp != AllReduceFusionOp::NONE)
         {
-            allreduce_fusion_params.residual_in = residual.value().data_ptr();
+            if (mOp != AllReduceFusionOp::RMS_NORM)
+            {
+                allreduce_fusion_params.residual_in = residual.value().data_ptr();
+            }
             allreduce_fusion_params.rms_gamma = norm_weight.value().data_ptr();
             allreduce_fusion_params.rms_eps = mEps;
         }
@@ -821,6 +821,7 @@ private:
         switch (mOp)
         {
         case AllReduceFusionOp::NONE: return {reduce_out};
+        case AllReduceFusionOp::RMS_NORM: return {norm_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM: return {norm_out, residual_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return {quant_out, residual_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: return {norm_out, quant_out, residual_out};
@@ -855,6 +856,17 @@ private:
         params.fusion_params.hidden_size = hidden_size;
         params.fusion_params.eps = mEps;
         params.fusion_params.intermediate_buffer = reduce_output.mutable_data_ptr();
+
+        if (mOp == AllReduceFusionOp::RMS_NORM)
+        {
+            // RMS_NORM: no residual addition — force nullptr so the kernel
+            // dispatches with Residual=false regardless of what the caller passed.
+            params.fusion_params.residual_buffer = nullptr;
+            tensorrt_llm::kernels::residualRmsNorm(params, mType, stream, AllReduceFusionOp::RESIDUAL_RMS_NORM);
+            return {norm_out};
+        }
+
+        // All remaining patterns use residual + rmsnorm.
         tensorrt_llm::kernels::residualRmsNorm(params, mType, stream, AllReduceFusionOp::RESIDUAL_RMS_NORM);
 
         // If no quantization is needed, return the norm and residual outputs.
@@ -965,7 +977,7 @@ private:
         MNNVLFabricInfo info;
 
 #if ENABLE_MULTI_DEVICE
-        // 1. Check CUDA driver version (needs >= 12.0.10)
+        // Check CUDA driver version (needs >= 12.0.10)
         int cudaDriverVersion = -1;
         TLLM_CUDA_CHECK(cudaDriverGetVersion(&cudaDriverVersion));
         if (cudaDriverVersion < 12010)
@@ -974,7 +986,7 @@ private:
             return info;
         }
 
-        // 2. Check multicast support
+        // Check multicast support
         CUdevice cuDevice;
         TLLM_CU_CHECK(cuDeviceGet(&cuDevice, deviceId));
         auto cudaDriver = tensorrt_llm::common::CUDADriverWrapper::getInstance();
@@ -988,7 +1000,7 @@ private:
             return info;
         }
 
-        // 3. Check fabric handle support
+        // Check fabric handle support
         int fabricHandleSupported = 0;
         TLLM_CU_CHECK(cudaDriver->cuDeviceGetAttribute(
             &fabricHandleSupported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, cuDevice));
@@ -998,9 +1010,10 @@ private:
             return info;
         }
 
-        // 4. Check NVML GPU Fabric Info using versioned API
+        // Check NVML GPU Fabric Info using versioned API (runtime dispatch)
+        auto nvml = NVMLWrapper::getInstance();
         nvmlDevice_t nvmlDevice;
-        nvmlReturn_t nvmlResult = nvmlDeviceGetHandleByIndex(deviceId, &nvmlDevice);
+        nvmlReturn_t nvmlResult = nvml->nvmlDeviceGetHandleByIndex(deviceId, &nvmlDevice);
         if (nvmlResult != NVML_SUCCESS)
         {
             TLLM_LOG_DEBUG("MNNVL check: Failed to get NVML device handle for device %d - error=%d", deviceId,
@@ -1008,24 +1021,48 @@ private:
             return info;
         }
 
-        nvmlGpuFabricInfoV_t fabricInfoV;
-        std::memset(&fabricInfoV, 0, sizeof(fabricInfoV));
-        fabricInfoV.version = NVML_STRUCT_VERSION(GpuFabricInfo, 3);
-        nvmlResult = nvmlDeviceGetGpuFabricInfoV(nvmlDevice, &fabricInfoV);
+        nvmlGpuFabricState_t fabricState;
+        nvmlReturn_t fabricStatus;
+        unsigned char fabricClusterUuid[NVML_GPU_FABRIC_UUID_LEN];
+        unsigned int fabricCliqueId;
+        if (nvml->hasGpuFabricInfoV())
+        {
+            nvmlGpuFabricInfoV_t fabricInfoV;
+            std::memset(&fabricInfoV, 0, sizeof(fabricInfoV));
+            fabricInfoV.version = nvmlGpuFabricInfo_v2;
+            nvmlResult = nvml->nvmlDeviceGetGpuFabricInfoV(nvmlDevice, &fabricInfoV);
+            fabricState = fabricInfoV.state;
+            fabricStatus = fabricInfoV.status;
+            std::memcpy(fabricClusterUuid, fabricInfoV.clusterUuid, NVML_GPU_FABRIC_UUID_LEN);
+            fabricCliqueId = fabricInfoV.cliqueId;
+        }
+        else if (nvml->hasGpuFabricInfo())
+        {
+            nvmlGpuFabricInfo_t fabricInfoLegacy;
+            nvmlResult = nvml->nvmlDeviceGetGpuFabricInfo(nvmlDevice, &fabricInfoLegacy);
+            fabricState = fabricInfoLegacy.state;
+            fabricStatus = fabricInfoLegacy.status;
+            std::memcpy(fabricClusterUuid, fabricInfoLegacy.clusterUuid, NVML_GPU_FABRIC_UUID_LEN);
+            fabricCliqueId = fabricInfoLegacy.cliqueId;
+        }
+        else
+        {
+            TLLM_LOG_DEBUG("MNNVL check: Neither nvmlDeviceGetGpuFabricInfoV nor nvmlDeviceGetGpuFabricInfo available");
+            return info;
+        }
         if (nvmlResult != NVML_SUCCESS)
         {
             TLLM_LOG_DEBUG(
-                "MNNVL check: nvmlDeviceGetGpuFabricInfoV failed for device %d - error=%d (not supported or "
+                "MNNVL check: nvmlDeviceGetGpuFabricInfo failed for device %d - error=%d (not supported or "
                 "no fabric manager)",
                 deviceId, static_cast<int>(nvmlResult));
             return info;
         }
 
         // Check if fabric is fully initialized
-        if (fabricInfoV.state != NVML_GPU_FABRIC_STATE_COMPLETED || fabricInfoV.status != NVML_SUCCESS)
+        if (fabricState != NVML_GPU_FABRIC_STATE_COMPLETED || fabricStatus != NVML_SUCCESS)
         {
-            TLLM_LOG_DEBUG(
-                "MNNVL check: Fabric state not complete - state=%u status=%u", fabricInfoV.state, fabricInfoV.status);
+            TLLM_LOG_DEBUG("MNNVL check: Fabric state not complete - state=%u status=%u", fabricState, fabricStatus);
             return info;
         }
 
@@ -1034,7 +1071,7 @@ private:
         bool clusterUuidValid = false;
         for (int i = 0; i < NVML_GPU_FABRIC_UUID_LEN; ++i)
         {
-            if (fabricInfoV.clusterUuid[i] != 0)
+            if (fabricClusterUuid[i] != 0)
             {
                 clusterUuidValid = true;
                 break;
@@ -1047,7 +1084,7 @@ private:
             return info;
         }
 
-        // 5. Check NVLink links are active (similar to Python support_nvlink(True))
+        // Check NVLink links are active (similar to Python support_nvlink(True))
         unsigned int activeLinks = 0;
         unsigned int availableLinks = 0;
 
@@ -1055,12 +1092,12 @@ private:
         {
             unsigned int capP2p = 0;
             nvmlReturn_t capResult
-                = nvmlDeviceGetNvLinkCapability(nvmlDevice, link, NVML_NVLINK_CAP_P2P_SUPPORTED, &capP2p);
+                = nvml->nvmlDeviceGetNvLinkCapability(nvmlDevice, link, NVML_NVLINK_CAP_P2P_SUPPORTED, &capP2p);
             if (capResult == NVML_SUCCESS && capP2p)
             {
                 availableLinks++;
                 nvmlEnableState_t linkState;
-                if (nvmlDeviceGetNvLinkState(nvmlDevice, link, &linkState) == NVML_SUCCESS
+                if (nvml->nvmlDeviceGetNvLinkState(nvmlDevice, link, &linkState) == NVML_SUCCESS
                     && linkState == NVML_FEATURE_ENABLED)
                 {
                     activeLinks++;
@@ -1077,12 +1114,12 @@ private:
         }
 
         // Device supports MNNVL - copy fabric info
-        std::memcpy(info.clusterUuid, fabricInfoV.clusterUuid, NVML_GPU_FABRIC_UUID_LEN);
-        info.cliqueId = fabricInfoV.cliqueId;
+        std::memcpy(info.clusterUuid, fabricClusterUuid, NVML_GPU_FABRIC_UUID_LEN);
+        info.cliqueId = fabricCliqueId;
         info.isValid = true;
 
         TLLM_LOG_INFO("MNNVL check: Device %d supports MNNVL (clusterUuid=%s, cliqueId=%u)", deviceId,
-            info.getClusterUuidString().c_str(), fabricInfoV.cliqueId);
+            info.getClusterUuidString().c_str(), fabricCliqueId);
 #endif
         return info;
     }
@@ -1104,6 +1141,7 @@ private:
         bool is_inter_node = (mGroup.size() != local_group.size());
 
         NvmlManager nvml_manager;
+        auto const& nvml = nvml_manager.sharedWrapper();
         mIsP2PSupported = true;
         mIsNVLINKSupported = true;
         mIsMNNVLSupported = false;
@@ -1134,26 +1172,27 @@ private:
                     }
 
                     nvmlDevice_t first_device;
-                    NVML_CHECK_THROW(nvmlDeviceGetHandleByIndex(first_device_id, &first_device));
+                    NVML_CHECK_THROW(nvml->nvmlDeviceGetHandleByIndex(first_device_id, &first_device));
 
                     bool is_NVLINK = false;
 
                     for (unsigned int link = 0; link < NVML_NVLINK_MAX_LINKS; link++)
                     {
                         nvmlPciInfo_t remote_pci_info;
-                        if (nvmlDeviceGetNvLinkRemotePciInfo_v2(first_device, link, &remote_pci_info) != NVML_SUCCESS)
+                        if (nvml->nvmlDeviceGetNvLinkRemotePciInfo(first_device, link, &remote_pci_info)
+                            != NVML_SUCCESS)
                         {
                             continue;
                         }
 
                         nvmlDevice_t remote_device;
-                        auto const result = nvmlDeviceGetHandleByPciBusId_v2(remote_pci_info.busId, &remote_device);
+                        auto const result = nvml->nvmlDeviceGetHandleByPciBusId(remote_pci_info.busId, &remote_device);
 
                         if (result == NVML_SUCCESS)
                         {
                             // Two GPUs are connected directly through nvlink
                             unsigned int remote_device_id;
-                            NVML_CHECK_THROW(nvmlDeviceGetIndex(remote_device, &remote_device_id));
+                            NVML_CHECK_THROW(nvml->nvmlDeviceGetIndex(remote_device, &remote_device_id));
 
                             if (remote_device_id == static_cast<unsigned int>(second_device_id))
                             {
@@ -1167,12 +1206,12 @@ private:
                             // determine whether nvlink is supported by whether two GPUs are connected to the same
                             // nvswitch.
                             nvmlDevice_t second_device;
-                            NVML_CHECK_THROW(nvmlDeviceGetHandleByIndex(second_device_id, &second_device));
+                            NVML_CHECK_THROW(nvml->nvmlDeviceGetHandleByIndex(second_device_id, &second_device));
 
                             for (unsigned int second_link = 0; second_link < NVML_NVLINK_MAX_LINKS; second_link++)
                             {
                                 nvmlPciInfo_t second_remote_pci_info;
-                                if (nvmlDeviceGetNvLinkRemotePciInfo_v2(
+                                if (nvml->nvmlDeviceGetNvLinkRemotePciInfo(
                                         second_device, second_link, &second_remote_pci_info)
                                     != NVML_SUCCESS)
                                 {
@@ -1388,7 +1427,6 @@ private:
     bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size)
     {
         // If messageSize is greater than maxWorkspaceSize or topology is unsuitable, use NCCL fallback.
-        // TODO: Use NCCL_SYMMETRIC once the memory allocation issue is resolved.
         if (message_size_bytes > max_workspace_size || !mIsP2PSupported || !mIsNVLINKSupported)
         {
             return true;
@@ -1427,6 +1465,75 @@ private:
 } // namespace
 
 #endif // ENABLE_MULTI_DEVICE
+
+void preallocateNCCLWindowBuffer(
+    torch::Tensor const& input, torch::List<int64_t> const& group, const int64_t buffersPerSize)
+{
+#if ENABLE_MULTI_DEVICE
+    if (buffersPerSize <= 0 || group.size() == 0 || input.numel() == 0 || input.size(0) == 0)
+    {
+        return;
+    }
+
+    std::set<int> groupSet;
+    for (auto const& rank : group)
+    {
+        groupSet.insert(static_cast<int>(rank));
+    }
+
+    auto const commPtr = getComm(groupSet);
+    if (!commPtr || *commPtr == nullptr)
+    {
+        TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffers] NCCL comm is null; skipping preallocation");
+        return;
+    }
+
+    using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
+    auto& allocator = NCCLWindowAllocator::getInstance();
+    const ncclComm_t comm = *commPtr;
+
+    const int64_t numTokens = input.size(0);
+    const int64_t elementsPerToken = input.numel() / numTokens;
+    if (elementsPerToken <= 0)
+    {
+        return;
+    }
+    const size_t bufferSize = static_cast<size_t>(numTokens) * static_cast<size_t>(elementsPerToken)
+        * static_cast<size_t>(input.element_size());
+    if (bufferSize == 0)
+    {
+        return;
+    }
+    TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] Pre-allocating %ld buffer(s) for tokens=%ld (%zu bytes) comm %p",
+        buffersPerSize, numTokens, bufferSize, static_cast<void*>(comm));
+    std::vector<void*> allocatedPtrs;
+    allocatedPtrs.reserve(buffersPerSize);
+    try
+    {
+        for (int64_t i = 0; i < buffersPerSize; ++i)
+        {
+            auto buffer = allocator.requestBuffer(comm, bufferSize);
+            if (!buffer.isValid())
+            {
+                break;
+            }
+            allocatedPtrs.push_back(buffer.ptr);
+        }
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_DEBUG("[preallocateNCCLWindowBuffer] requestBuffer failed for %zu bytes: %s", bufferSize, e.what());
+    }
+
+    for (auto ptr : allocatedPtrs)
+    {
+        allocator.releaseBuffer(comm, ptr);
+    }
+#else
+    (void) group;
+    (void) buffersPerSize;
+#endif
+}
 
 std::vector<torch::Tensor> allreduce_raw(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
     torch::optional<torch::Tensor> const& norm_weight, torch::optional<torch::Tensor> const& scale,
@@ -1559,15 +1666,15 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor const& residual, torch::T
 //     expanded_idx_to_permuted_idx [m, top_k]
 //     expert_scale_factor [m, top_k]
 //     shared_expert_output [m, hidden_dim]
-std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input, torch::Tensor const& residual,
-    torch::Tensor const& norm_weight, torch::Tensor const& expanded_idx_to_permuted_idx,
-    torch::optional<torch::Tensor> const& shared_expert_output,
+std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input,
+    torch::optional<torch::Tensor> const& residual, torch::Tensor const& norm_weight,
+    torch::Tensor const& expanded_idx_to_permuted_idx, torch::optional<torch::Tensor> const& shared_expert_output,
     torch::optional<torch::Tensor> const& expert_scale_factor, torch::Tensor workspace, int64_t const rank,
     int64_t const nranks, double const eps)
 {
     auto allreduce_fusion_params = tensorrt_llm::kernels::ar_fusion::moe::MoeFinalizeAllReduceFusionParams();
 
-    int hidden_dim = residual.size(-1);
+    int hidden_dim = norm_weight.size(0);
     int top_k = expanded_idx_to_permuted_idx.size(-1);
 
     allreduce_fusion_params.quant_out = nullptr;
@@ -1576,15 +1683,32 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input, to
     allreduce_fusion_params.nranks = static_cast<int>(nranks);
     allreduce_fusion_params.rank = static_cast<int>(rank);
     allreduce_fusion_params.dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+
+    // Determine num_tokens from either residual or shared_expert_output
+    int num_tokens;
+    if (residual.has_value())
+    {
+        num_tokens = residual.value().size(0);
+    }
+    else if (shared_expert_output.has_value())
+    {
+        num_tokens = shared_expert_output.value().size(0);
+    }
+    else
+    {
+        // Fallback: infer from expanded_idx_to_permuted_idx
+        num_tokens = expanded_idx_to_permuted_idx.size(0);
+    }
+
     // size: num_token * hidden_dim
-    allreduce_fusion_params.size = residual.numel();
+    allreduce_fusion_params.size = num_tokens * hidden_dim;
     allreduce_fusion_params.hidden_dim = hidden_dim;
 
     // workspace: AR scratch space
     allreduce_fusion_params.workspace = reinterpret_cast<void**>(workspace.mutable_data_ptr());
     allreduce_fusion_params.rms_gamma = norm_weight.data_ptr();
     allreduce_fusion_params.rms_eps = static_cast<float>(eps);
-    allreduce_fusion_params.residual_in = residual.data_ptr();
+    allreduce_fusion_params.residual_in = residual.has_value() ? residual.value().data_ptr() : nullptr;
     allreduce_fusion_params.stream = at::cuda::getCurrentCUDAStream(norm_weight.get_device());
 
     // MOE Reduction specific params
@@ -1601,16 +1725,30 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input, to
     allreduce_fusion_params.shared_expert_output
         = shared_expert_output.has_value() ? shared_expert_output.value().data_ptr() : nullptr;
 
-    // output tensors
-    torch::Tensor norm_out = torch::empty_like(residual);
-    torch::Tensor residual_out = torch::empty_like(residual);
+    // output tensors — shape based on [num_tokens, hidden_dim]
+    auto output_opts = torch::TensorOptions().dtype(input.dtype()).device(input.device());
+    torch::Tensor norm_out = torch::empty({num_tokens, hidden_dim}, output_opts);
+    torch::Tensor residual_out;
 
     allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
-    allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
+
+    if (residual.has_value())
+    {
+        residual_out = torch::empty_like(residual.value());
+        allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
+    }
+    else
+    {
+        allreduce_fusion_params.residual_out = nullptr;
+    }
 
     tensorrt_llm::kernels::ar_fusion::moe::moefinalize_allreduce_fusion_op(allreduce_fusion_params);
 
-    return {norm_out, residual_out};
+    if (residual.has_value())
+    {
+        return {norm_out, residual_out};
+    }
+    return {norm_out};
 }
 
 std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::optional<torch::Tensor> const& gamma,
@@ -1738,7 +1876,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "moe_finalize_allreduce("
         "Tensor input,"
-        "Tensor residual,"
+        "Tensor? residual,"
         "Tensor norm_weight,"
         "Tensor expanded_idx_to_permuted_idx,"
         "Tensor? shared_expert_output,"
@@ -1747,6 +1885,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int rank,"
         "int nranks,"
         "float eps) -> Tensor[]");
+    m.def("preallocate_nccl_window_buffer(Tensor input, int[] group, int count) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -1756,6 +1895,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("allreduce_pg", &tensorrt_llm::torch_ext::allreduce_pg);
     m.impl("moe_allreduce", &tensorrt_llm::torch_ext::moe_allreduce);
     m.impl("moe_finalize_allreduce", &tensorrt_llm::torch_ext::moe_finalize_allreduce);
+    m.impl("preallocate_nccl_window_buffer", &tensorrt_llm::torch_ext::preallocateNCCLWindowBuffer);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CPU, m)
@@ -1767,4 +1907,5 @@ TORCH_LIBRARY_IMPL(trtllm, CPU, m)
                 reinterpret_cast<int64_t*>(workspace.data_ptr()), (int) tp_size);
             return std::vector<at::Tensor>{};
         });
+    m.impl("preallocate_nccl_window_buffer", [](at::Tensor const&, torch::List<int64_t> const&, int64_t) { return; });
 }

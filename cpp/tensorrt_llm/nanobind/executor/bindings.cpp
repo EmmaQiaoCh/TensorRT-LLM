@@ -94,7 +94,8 @@ void initBindings(nb::module_& m)
 
     nb::enum_<tle::ContextChunkingPolicy>(m, "ContextChunkingPolicy")
         .value("EQUAL_PROGRESS", tle::ContextChunkingPolicy::kEQUAL_PROGRESS)
-        .value("FIRST_COME_FIRST_SERVED", tle::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED);
+        .value("FIRST_COME_FIRST_SERVED", tle::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED)
+        .value("FORCE_CHUNK", tle::ContextChunkingPolicy::kFORCE_CHUNK);
 
     nb::enum_<tle::CommunicationType>(m, "CommunicationType").value("MPI", tle::CommunicationType::kMPI);
 
@@ -225,15 +226,20 @@ void initBindings(nb::module_& m)
         .def_prop_ro("mm_keys",
             [](tle::KVCacheStoredBlockData const& self)
             {
-                // Convert std::vector<MmKey> to Python list of tuples (bytes, int)
-                // MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>
+                // Convert std::vector<MmKey> to Python list of tuples (bytes, int, optional<str>)
+                // MmKey = struct { hash, startOffset, uuid }
                 nb::list result;
                 for (auto const& mmKey : self.mmKeys)
                 {
-                    auto const& hashArray = mmKey.first;
-                    auto offset = mmKey.second;
-                    nb::bytes hashBytes(reinterpret_cast<char const*>(hashArray.data()), hashArray.size());
-                    result.append(nb::make_tuple(hashBytes, offset));
+                    nb::bytes hashBytes(reinterpret_cast<char const*>(mmKey.hash.data()), mmKey.hash.size());
+                    if (mmKey.uuid.has_value())
+                    {
+                        result.append(nb::make_tuple(hashBytes, mmKey.startOffset, mmKey.uuid.value()));
+                    }
+                    else
+                    {
+                        result.append(nb::make_tuple(hashBytes, mmKey.startOffset, nb::none()));
+                    }
                 }
                 return result;
             });

@@ -4,6 +4,7 @@ import multiprocessing
 import platform
 import signal
 import traceback
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from pathlib import Path
@@ -34,7 +35,8 @@ from ..sampling_params import (BatchedLogitsProcessor, LogprobParams,
 from ..scheduling_params import SchedulingParams
 from .ipc import FusedIpcQueue
 from .postproc_worker import PostprocParams, PostprocWorkerConfig
-from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
+from .request import (DEFAULT_REQUEST_PRIORITY, GenerationRequest, LoRARequest,
+                      PromptAdapterRequest)
 from .result import GenerationResult, IterationResult
 from .utils import IntraProcessQueue, ProcessPoolExecutorSession, RequestError
 
@@ -88,7 +90,10 @@ class GenerationExecutor(ABC):
         self.kv_events_queues = IterationResultQueue()
         self.stats_queues = IterationResultQueue()
 
-        atexit.register(self.shutdown)
+        atexit.register(
+            lambda ref, finalizer=type(self).shutdown: finalizer(obj)
+            if (obj := ref()) is not None else None,
+            weakref.ref(self))
 
         # This is used to capture the exceptions from the threads.
         self._error_queue = Queue()
@@ -127,6 +132,7 @@ class GenerationExecutor(ABC):
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt_id: Optional[int] = None,
         arrival_time: Optional[float] = None,
+        priority: float = DEFAULT_REQUEST_PRIORITY,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -153,7 +159,8 @@ class GenerationExecutor(ABC):
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
             cache_salt_id=cache_salt_id,
-            arrival_time=arrival_time)
+            arrival_time=arrival_time,
+            priority=priority)
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):
@@ -221,7 +228,7 @@ class GenerationExecutor(ABC):
             self, request: GenerationRequest) -> Optional[LogprobParams]:
         """Store logprobs-related fields from request for the later logprob calculation."""
         logprob_params = None
-        if request.sampling_params.logprobs is not None or request.sampling_params.prompt_logprobs:
+        if request.sampling_params.logprobs is not None or request.sampling_params.prompt_logprobs is not None:
             logprob_params = LogprobParams(
                 logprobs=request.sampling_params.logprobs,
                 prompt_logprobs=request.sampling_params.prompt_logprobs,
@@ -324,7 +331,7 @@ class GenerationExecutor(ABC):
         """
         if self._iter_stats_result is None:
             print_colored(
-                "Iteration statistics are not available yet. To collect runtime statistics, please call get_stats_async() in async coroutine or the /metrics endpoint (if you're using trtllm-serve) AFTER prompts have been submitted.\n",
+                "Iteration statistics are not available yet. To collect runtime statistics, please call aget_stats() in async coroutine or the /metrics endpoint (if you're using trtllm-serve) AFTER prompts have been submitted.\n",
                 "yellow")
             return empty_async_iterable()
 
@@ -534,8 +541,8 @@ class GenerationExecutor(ABC):
                 use_worker=True)
 
         # For single-gpu case:
-        # Partition the workload to multiple process for streaming performance.
-        # While this requires uses to protect their entrypoint to
+        # Partition the workload to multiple processes for streaming performance.
+        # While this requires users to protect their entrypoint to
         # `if __name__ == "__main__":`.
         if not platform.system() == 'Windows':
             if orchestrator_is_rpc:

@@ -305,22 +305,29 @@ void initRequestBindings(nb::module_& m)
         .def("__setstate__", loraConfigSetstate);
 
     auto multimodalInputGetstate = [](tle::MultimodalInput const& self)
-    { return nb::make_tuple(self.getMultimodalHashes(), self.getMultimodalPositions(), self.getMultimodalLengths()); };
+    {
+        return nb::make_tuple(self.getMultimodalHashes(), self.getMultimodalPositions(), self.getMultimodalLengths(),
+            self.getMultimodalUuids());
+    };
     auto multimodalInputSetstate = [](tle::MultimodalInput& multimodalInput, nb::tuple const& state)
     {
-        if (state.size() != 3)
+        if (state.size() != 4)
         {
             throw std::runtime_error("Invalid MultimodalInput state!");
         }
         new (&multimodalInput) tle::MultimodalInput(nb::cast<std::vector<std::vector<SizeType32>>>(state[0]),
-            nb::cast<std::vector<SizeType32>>(state[1]), nb::cast<std::vector<SizeType32>>(state[2]));
+            nb::cast<std::vector<SizeType32>>(state[1]), nb::cast<std::vector<SizeType32>>(state[2]),
+            nb::cast<std::optional<std::vector<std::optional<std::string>>>>(state[3]));
     };
     nb::class_<tle::MultimodalInput>(m, "MultimodalInput")
-        .def(nb::init<std::vector<std::vector<SizeType32>>, std::vector<SizeType32>, std::vector<SizeType32>>(),
-            nb::arg("multimodal_hashes"), nb::arg("multimodal_positions"), nb::arg("multimodal_lengths"))
+        .def(nb::init<std::vector<std::vector<SizeType32>>, std::vector<SizeType32>, std::vector<SizeType32>,
+                 std::optional<std::vector<std::optional<std::string>>>>(),
+            nb::arg("multimodal_hashes"), nb::arg("multimodal_positions"), nb::arg("multimodal_lengths"),
+            nb::arg("multimodal_uuids") = nb::none())
         .def_prop_ro("multimodal_hashes", &tle::MultimodalInput::getMultimodalHashes)
         .def_prop_ro("multimodal_positions", &tle::MultimodalInput::getMultimodalPositions)
         .def_prop_ro("multimodal_lengths", &tle::MultimodalInput::getMultimodalLengths)
+        .def_prop_ro("multimodal_uuids", &tle::MultimodalInput::getMultimodalUuids)
         .def("__getstate__", multimodalInputGetstate)
         .def("__setstate__", multimodalInputSetstate);
 
@@ -408,7 +415,8 @@ void initRequestBindings(nb::module_& m)
         kvCacheRetentionConfig, "TokenRangeRetentionConfig")
         .def(nb::init<SizeType32, std::optional<SizeType32>, tle::RetentionPriority,
                  std::optional<std::chrono::milliseconds>>(),
-            nb::arg("token_start"), nb::arg("token_end"), nb::arg("priority"), nb::arg("duration_ms") = nb::none())
+            nb::arg("token_start"), nb::arg("token_end").none(), nb::arg("priority"),
+            nb::arg("duration_ms") = nb::none())
         .def_rw("token_start", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::tokenStart)
         .def_rw("token_end", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::tokenEnd)
         .def_rw("priority", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::priority)
@@ -426,7 +434,7 @@ void initRequestBindings(nb::module_& m)
             nb::arg("token_range_retention_configs"),
             nb::arg("decode_retention_priority") = tle::KvCacheRetentionConfig::kDefaultRetentionPriority,
             nb::arg("decode_duration_ms") = nb::none(), nb::arg("transfer_mode") = tle::KvCacheTransferMode::DRAM,
-            nb::arg("directory") = nb::none())
+            nb::arg("directory") = "")
         .def_prop_ro("token_range_retention_configs", &tle::KvCacheRetentionConfig::getTokenRangeRetentionConfigs)
         .def_prop_ro("decode_retention_priority", &tle::KvCacheRetentionConfig::getDecodeRetentionPriority)
         .def_prop_ro("decode_duration_ms", &tle::KvCacheRetentionConfig::getDecodeDurationMs)
@@ -703,7 +711,7 @@ void initRequestBindings(nb::module_& m)
         nb::arg("guided_decoding_params") = nb::none(),
         nb::arg("language_adapter_uid") = nb::none(),
         nb::arg("allotted_time_ms") = nb::none(),
-        nb::arg("cache_salt_id") = nb::none(),
+                nb::arg("cache_salt_id") = nb::none(),
         nb::arg("disagg_request_id") = nb::none()
     )         // clang-format on
         .def_prop_ro("input_token_ids", &tle::Request::getInputTokenIds)
@@ -750,6 +758,7 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw("cache_salt_id", &tle::Request::getCacheSaltID, &tle::Request::setCacheSaltID)
         .def_prop_rw("context_phase_params", &tle::Request::getContextPhaseParams, &tle::Request::setContextPhaseParams)
         .def_prop_rw("disagg_request_id", &tle::Request::getDisaggRequestId, &tle::Request::setDisaggRequestId)
+        .def_prop_rw("priority", &tle::Request::getPriority, &tle::Request::setPriority)
         .def("__getstate__", requestGetstate)
         .def("__setstate__", requestSetstate);
     request.attr("BATCHED_POST_PROCESSOR_NAME") = tle::Request::kBatchedPostProcessorName;

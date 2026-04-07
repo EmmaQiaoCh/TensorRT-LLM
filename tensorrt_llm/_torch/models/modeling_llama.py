@@ -23,8 +23,8 @@ from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
-                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       MultimodalPlaceholderMetadata,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...sampling_params import SamplingParams
@@ -449,6 +449,10 @@ class Llama4DecoderLayer(DecoderLayer):
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
+        # When post_load_weights() chains layernorms across layers,
+        # this flag is set to True to skip the input layernorm in
+        # forward() since it is handled by the previous layer.
+        self.skip_input_layernorm = False
 
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
@@ -493,6 +497,8 @@ class Llama4DecoderLayer(DecoderLayer):
 
         if residual is None:
             residual = hidden_states
+
+        if not self.skip_input_layernorm:
             hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
@@ -668,6 +674,10 @@ class LlamaDecoderLayer(DecoderLayer):
             quantize_type="nvfp4"
             if not self.disable_nvfp4_layernorm_fusion and self.is_nvfp4
             and not (differ_pp_stage_with_previous_layer) else None)
+        # When post_load_weights() chains layernorms across layers,
+        # this flag is set to True to skip the input layernorm in
+        # forward() since it is handled by the previous layer.
+        self.skip_input_layernorm = False
 
         self.post_attention_layernorm = RMSNorm(
             hidden_size=config.hidden_size,
@@ -765,6 +775,8 @@ class LlamaDecoderLayer(DecoderLayer):
     ) -> Union[torch.Tensor, Fp4QuantizedTensor]:
         if residual is None:
             residual = hidden_states
+
+        if not self.skip_input_layernorm:
             hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self.self_attn(
@@ -936,6 +948,10 @@ class Llama4Model(DecoderModel):
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
+        # When post_load_weights() chains the final norm into the
+        # last decoder layer, this flag is set to True to skip
+        # applying it again in forward().
+        self.skip_norm = False
 
     def forward(
         self,
@@ -968,6 +984,10 @@ class Llama4Model(DecoderModel):
                 spec_metadata=spec_metadata,
                 lora_params=lora_params,
             )
+
+        # If self.norm is not handled by the last layer, apply it here.
+        if not self.skip_norm:
+            hidden_states = self.norm(hidden_states)
 
         return hidden_states
 
@@ -1033,6 +1053,10 @@ class LlamaModel(DecoderModel):
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
+        # When post_load_weights() chains the final norm into the
+        # last decoder layer, this flag is set to True to skip
+        # applying it again in forward().
+        self.skip_norm = False
 
     def forward(
         self,
@@ -1065,6 +1089,10 @@ class LlamaModel(DecoderModel):
                 lora_params=lora_params,
             )
 
+        # If self.norm is not handled by the last layer, apply it here.
+        if not self.skip_norm:
+            hidden_states = self.norm(hidden_states)
+
         return hidden_states
 
 
@@ -1082,9 +1110,11 @@ class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
+                self.model.skip_norm = True
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+                self.model.layers[idx + 1].skip_input_layernorm = True
                 layer.next_attn = self.model.layers[idx + 1].self_attn
 
 
@@ -1137,9 +1167,6 @@ class Llama4VisionEncoder(nn.Module):
             pixel_values).last_hidden_state.flatten(0, 1)
         image_features = self.mm_projector(image_features)
         return [image_features]
-
-
-from transformers import AutoTokenizer, PretrainedConfig
 
 
 class Llama4InputProcessor(BaseMultimodalInputProcessor,
@@ -1371,6 +1398,7 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={"image": "<|image|>"},
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.STRING,
     ))
 class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                                                                  Llama4Config]):
@@ -1456,9 +1484,11 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
+                self.model.skip_norm = True
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+                self.model.layers[idx + 1].skip_input_layernorm = True
                 layer.next_attn = self.model.layers[idx + 1].self_attn
 
 
