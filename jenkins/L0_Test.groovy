@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@emma/block_bad_nodes', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@emma/update_nsc_login_node', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
