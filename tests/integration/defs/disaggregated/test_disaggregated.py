@@ -137,7 +137,6 @@ def build_worker_config(base_config: dict[str, Any],
     return worker_config
 
 
-# {$nv-internal-release begin}
 def get_test_config(test_desc, example_dir, test_root):
     """Get config file path for a test description."""
     test_configs_root = f"{test_root}/test_configs"
