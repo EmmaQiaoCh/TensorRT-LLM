@@ -1781,6 +1781,16 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch26/scratch.trt_llm_data
         """
     }
+    // H100 PCIe pool label is "h100-cr" (see BUILD_CONFIGS). Do not use type.contains("h100") — that also matches "dgx-h100-*".
+    def hostnameMatch = ""
+    if (type.contains("h100-cr")) {
+        hostnameMatch = """
+                              - key: "kubernetes.io/hostname"
+                                operator: In
+                                values:
+                                - "viking-prod-208.ipp2u1.colossus"
+"""
+    }
 
     def podConfig = [
         cloud: targetCloud,
@@ -1802,6 +1812,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 operator: NotIn
                                 values:
                                 - "core"
+                ${hostnameMatch}
                 nodeSelector: ${selectors}
                 containers:
                   ${containerConfig}
