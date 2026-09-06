@@ -27,7 +27,8 @@ import triton_kernels.swiglu
 from triton_kernels.matmul import (FlexCtx, FnSpecs, FusedActivation,
                                    PrecisionConfig, matmul)
 from triton_kernels.numerics import InFlexData
-from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
+from triton_kernels.numerics_details.mxfp import (MXFP_BLOCK_SIZE,
+                                                  downcast_to_mxfp_torch)
 from triton_kernels.reduce import reduce as triton_reduce
 from triton_kernels.tensor import FP4, DataType, RaggedTensorMetadata
 from triton_kernels.tensor import Storage as TritonStorage
@@ -1463,6 +1464,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         else:
             flex_ctx_1 = FlexCtx()
         pc1 = PrecisionConfig(b_mx_scale=gemm1_scales,
+                              b_microblock_size=MXFP_BLOCK_SIZE.value,
                               flex_ctx=flex_ctx_1,
                               allow_tf32=False,
                               out_dtype=module.dtype)
@@ -1511,6 +1513,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         else:
             flex_ctx_2 = FlexCtx()
         pc2 = PrecisionConfig(b_mx_scale=gemm2_scales,
+                              b_microblock_size=MXFP_BLOCK_SIZE.value,
                               flex_ctx=flex_ctx_2,
                               allow_tf32=False,
                               out_dtype=module.dtype)
