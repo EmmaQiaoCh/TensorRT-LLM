@@ -19,6 +19,7 @@
 // (bloom/scripts/<host>-test-*) in which nothing has been read or changed within
 // it, and agent job logs (slurm-logs/slurm-<jobid>-<host>-test-*.out) older than
 // it. Also prunes enroot layer cache files neither read nor modified within the
+// retention period, and fat sqsh images not used within their own, shorter,
 // retention period.
 
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
@@ -140,12 +141,39 @@ def enrootCachePruneCommands(String homeDir, String days, boolean dryRun) {
     return commands.join(" ; ")
 }
 
-def pruneCluster(String clusterName, String days, boolean dryRun) {
+// Prunes the fat sqsh images L0_Test builds per pipeline (base image plus the
+// installed TensorRT-LLM package) that no job used within `days`: a job that
+// reuses one touches it, so mtime is the last use. Also prunes temp files left by
+// builders that died, which a live build replaces within a day.
+// Reports the cache before pruning and what is pruned.
+def fatSqshPruneCommands(String scratchPath, String days, boolean dryRun) {
+    def fatDir = "${scratchPath}/users/svc_tensorrt/fat_sqsh"
+    def findStale = "find -H ${fatDir} -maxdepth 1 -type f \\( -name 'fat-*.sqsh' ! -mtime -${days} -o -name 'fat-*.sqsh.*.tmp' ! -mtime -1 \\)"
+    def pruneLabel = "not used within ${days} days ${dryRun ? 'to prune' : 'pruned'}"
+    def commands = [
+        "echo 'fat sqsh ${fatDir} (last used, path):'",
+        "du -shH ${fatDir} 2>/dev/null | awk '{ printf \"  size: \"; print }'",
+        "${findStale} -printf '%TY-%Tm-%Td %p\\n' 2>/dev/null | sort | awk 'NR <= 3 { printf \"  oldest: \"; print } END { if (NR) { printf \"  newest: \"; print } print \"  ${pruneLabel}: \" NR }'",
+        "${findStale} -print0 2>/dev/null | du -ch --files0-from=- 2>/dev/null | tail -n 1 | awk '{ printf \"  size ${dryRun ? 'to prune' : 'pruned'}: \"; print }'",
+    ]
+    if (!dryRun) {
+        commands << "${findStale} -delete 2>/dev/null || true"
+    }
+    return commands.join(" ; ")
+}
+
+def pruneCluster(String clusterName, String days, String fatSqshDays, boolean dryRun) {
     def cluster = SlurmConfig.clusterConfig[clusterName]
     if (!cluster) {
         error("Unknown SLURM cluster '${clusterName}'.")
     }
     def homeDir = cluster.homeDir ?: "/home/svc_tensorrt"
+    def commands = pruneCommands(homeDir, days, dryRun) + " ; " + enrootCachePruneCommands(homeDir, days, dryRun)
+    if (cluster.scratchPath) {
+        commands += " ; " + fatSqshPruneCommands(cluster.scratchPath, fatSqshDays, dryRun)
+    } else {
+        echo "No scratchPath configured for ${clusterName}; skipping fat sqsh pruning."
+    }
     CloudManager.withSlurmFrontendFailover(this, clusterName, cluster) { remote ->
         Utils.exec(
             this,
@@ -154,10 +182,7 @@ def pruneCluster(String clusterName, String days, boolean dryRun) {
             timeout: 0,
             script: Utils.sshUserCmd(
                 remote,
-                Utils.bashWrappedRemoteCmd(
-                    pruneCommands(homeDir, days, dryRun) + " ; " +
-                        enrootCachePruneCommands(homeDir, days, dryRun)
-                )
+                Utils.bashWrappedRemoteCmd(commands)
             )
         )
     }
@@ -173,13 +198,17 @@ pipeline {
         disableConcurrentBuilds()
     }
     triggers {
-        cron('H 3 * * 0')
+        cron('H 3 * * *')
     }
     parameters {
         string(
             name: 'RETENTION_DAYS',
             defaultValue: '10',
             description: 'Prune SLURM job output not modified, and agent job dirs and enroot layer cache files neither read nor modified, within this many days.')
+        string(
+            name: 'FAT_SQSH_RETENTION_DAYS',
+            defaultValue: '2',
+            description: 'Prune fat sqsh images not used within this many days.')
         string(
             name: 'CLUSTERS',
             defaultValue: '',
@@ -197,10 +226,13 @@ pipeline {
                         if (!(params.RETENTION_DAYS ==~ /^[1-9][0-9]*$/)) {
                             error("RETENTION_DAYS must be a positive integer (got: '${params.RETENTION_DAYS}').")
                         }
+                        if (!(params.FAT_SQSH_RETENTION_DAYS ==~ /^[1-9][0-9]*$/)) {
+                            error("FAT_SQSH_RETENTION_DAYS must be a positive integer (got: '${params.FAT_SQSH_RETENTION_DAYS}').")
+                        }
                         def clusters = params.CLUSTERS?.trim()
                             ? params.CLUSTERS.split(',').collect { it.trim() }.findAll { it }
                             : defaultClusterNames()
-                        echo "Pruning output older than ${params.RETENTION_DAYS} days on: ${clusters.join(', ')}"
+                        echo "Pruning output older than ${params.RETENTION_DAYS} days, and fat sqsh images older than ${params.FAT_SQSH_RETENTION_DAYS} days, on: ${clusters.join(', ')}"
 
                         // Sequential: the shared lib installs ssh tools with apt
                         // on every connection, which cannot run concurrently.
@@ -209,7 +241,7 @@ pipeline {
                                 // One unreachable cluster must not block the others.
                                 catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
                                     timeout(time: 1, unit: 'HOURS') {
-                                        pruneCluster(clusterName, params.RETENTION_DAYS, params.DRY_RUN)
+                                        pruneCluster(clusterName, params.RETENTION_DAYS, params.FAT_SQSH_RETENTION_DAYS, params.DRY_RUN)
                                     }
                                 }
                             }
